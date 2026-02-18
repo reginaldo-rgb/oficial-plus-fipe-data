@@ -100,6 +100,20 @@ jobs:
         run: |
           RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/fipe-v${{ steps.meta.outputs.version }}/vehicles_db.json.gz"
           
+          # Create JSON payload in a file to avoid escaping issues
+          cat <<EOF > payload.json
+          {
+            "version": "${{ steps.meta.outputs.version }}",
+            "url": "$RELEASE_URL",
+            "size_bytes": ${{ steps.meta.outputs.gzip_size }},
+            "vehicles_count": ${{ steps.meta.outputs.count }},
+            "stats": ${{ steps.meta.outputs.stats }}
+          }
+          EOF
+          
+          echo "Payload preview:"
+          cat payload.json
+          
           echo "Sending metadata to Supabase..."
           
           HTTP_CODE=$(curl -s -o response.txt -w "%{http_code}" -X POST "$SUPABASE_URL/rest/v1/fipe_metadata" \
@@ -107,13 +121,7 @@ jobs:
             -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
             -H "Content-Type: application/json" \
             -H "Prefer: return=minimal" \
-            -d "{
-              \"version\": \"${{ steps.meta.outputs.version }}\",
-              \"url\": \"$RELEASE_URL\",
-              \"size_bytes\": ${{ steps.meta.outputs.gzip_size }},
-              \"vehicles_count\": ${{ steps.meta.outputs.count }},
-              \"stats\": ${{ steps.meta.outputs.stats }}
-            }")
+            -d @payload.json)
 
           if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
             echo "✅ Supabase metadata updated (HTTP $HTTP_CODE)"
