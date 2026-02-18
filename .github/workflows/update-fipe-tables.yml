@@ -1,0 +1,123 @@
+name: Update FIPE Tables
+
+on:
+  schedule:
+    # Day 10 of every month at 03:00 BRT (06:00 UTC)
+    - cron: '0 6 10 * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force update even if no changes detected'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  update-fipe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🟢 Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 📦 Install dependencies
+        run: npm install cheerio@1.0.0
+
+      - name: 🕷️ Run FIPE Scraper
+        id: scraper
+        run: node scripts/fipe-scraper.cjs
+        env:
+          NODE_OPTIONS: '--max-old-space-size=4096'
+
+      - name: 📋 Read metadata
+        id: meta
+        run: |
+          VERSION=$(jq -r '.version' dist-fipe/metadata.json)
+          COUNT=$(jq -r '.vehicles_count' dist-fipe/metadata.json)
+          GZIP_SIZE=$(stat -f%z dist-fipe/vehicles_db.json.gz 2>/dev/null || stat --printf="%s" dist-fipe/vehicles_db.json.gz)
+          GZIP_MB=$(echo "scale=2; $GZIP_SIZE / 1024 / 1024" | bc)
+          STATS=$(jq -c '.stats' dist-fipe/metadata.json)
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          echo "gzip_size=$GZIP_SIZE" >> $GITHUB_OUTPUT
+          echo "gzip_mb=$GZIP_MB" >> $GITHUB_OUTPUT
+          echo "stats=$STATS" >> $GITHUB_OUTPUT
+
+          echo "📊 Version: $VERSION"
+          echo "📊 Vehicles: $COUNT"
+          echo "📊 Size: $GZIP_MB MB"
+
+      - name: 🏷️ Create GitHub Release
+        id: release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: fipe-v${{ steps.meta.outputs.version }}
+          name: "Tabela FIPE - ${{ steps.meta.outputs.version }}"
+          body: |
+            ## 📊 Tabela FIPE - v${{ steps.meta.outputs.version }}
+
+            | Métrica | Valor |
+            |---------|-------|
+            | Total de Veículos | ${{ steps.meta.outputs.count }} |
+            | Tamanho (gzip) | ${{ steps.meta.outputs.gzip_mb }} MB |
+            | Stats | ${{ steps.meta.outputs.stats }} |
+
+            ### 📥 Download
+            - `vehicles_db.json.gz` - Base comprimida (usar no app)
+            - `vehicles_db.json` - Base descomprimida (debug)
+            - `metadata.json` - Metadados da versão
+
+            _Gerado automaticamente por GitHub Actions_
+          files: |
+            dist-fipe/vehicles_db.json.gz
+            dist-fipe/vehicles_db.json
+            dist-fipe/metadata.json
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🗃️ Update Supabase Metadata
+        if: ${{ env.SUPABASE_URL != '' && env.SUPABASE_SERVICE_ROLE_KEY != '' }}
+        run: |
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/fipe-v${{ steps.meta.outputs.version }}/vehicles_db.json.gz"
+
+          curl -X POST "$SUPABASE_URL/rest/v1/fipe_metadata" \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: return=minimal" \
+            -d "{
+              \"version\": \"${{ steps.meta.outputs.version }}\",
+              \"url\": \"$RELEASE_URL\",
+              \"size_bytes\": ${{ steps.meta.outputs.gzip_size }},
+              \"vehicles_count\": ${{ steps.meta.outputs.count }},
+              \"stats\": ${{ steps.meta.outputs.stats }}
+            }"
+
+          echo "✅ Supabase metadata updated"
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+      - name: 🧹 Cleanup
+        run: rm -rf dist-fipe
+
+      - name: ✅ Summary
+        run: |
+          echo "## 🎉 FIPE Update Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version:** ${{ steps.meta.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Vehicles:** ${{ steps.meta.outputs.count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Size:** ${{ steps.meta.outputs.gzip_mb }} MB" >> $GITHUB_STEP_SUMMARY
+          echo "- **Release:** [fipe-v${{ steps.meta.outputs.version }}](${{ steps.release.outputs.url }})" >> $GITHUB_STEP_SUMMARY
