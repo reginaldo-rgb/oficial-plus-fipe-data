@@ -19,6 +19,9 @@ jobs:
   update-fipe:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
     steps:
       - name: 📥 Checkout
@@ -87,12 +90,19 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: 🔍 Debug Secrets
+        run: |
+          if [ -n "$SUPABASE_URL" ]; then echo "SUPABASE_URL is set"; else echo "SUPABASE_URL is NOT set"; fi
+          if [ -n "$SUPABASE_SERVICE_ROLE_KEY" ]; then echo "SUPABASE_SERVICE_ROLE_KEY is set"; else echo "SUPABASE_SERVICE_ROLE_KEY is NOT set"; fi
+
       - name: 🗃️ Update Supabase Metadata
-        if: ${{ env.SUPABASE_URL != '' && env.SUPABASE_SERVICE_ROLE_KEY != '' }}
+        if: env.SUPABASE_URL != '' && env.SUPABASE_SERVICE_ROLE_KEY != ''
         run: |
           RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/fipe-v${{ steps.meta.outputs.version }}/vehicles_db.json.gz"
-
-          curl -X POST "$SUPABASE_URL/rest/v1/fipe_metadata" \
+          
+          echo "Sending metadata to Supabase..."
+          
+          HTTP_CODE=$(curl -s -o response.txt -w "%{http_code}" -X POST "$SUPABASE_URL/rest/v1/fipe_metadata" \
             -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
             -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
             -H "Content-Type: application/json" \
@@ -103,12 +113,15 @@ jobs:
               \"size_bytes\": ${{ steps.meta.outputs.gzip_size }},
               \"vehicles_count\": ${{ steps.meta.outputs.count }},
               \"stats\": ${{ steps.meta.outputs.stats }}
-            }"
+            }")
 
-          echo "✅ Supabase metadata updated"
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "✅ Supabase metadata updated (HTTP $HTTP_CODE)"
+          else
+            echo "❌ Failed to update Supabase (HTTP $HTTP_CODE)"
+            cat response.txt
+            exit 1
+          fi
 
       - name: 🧹 Cleanup
         run: rm -rf dist-fipe
