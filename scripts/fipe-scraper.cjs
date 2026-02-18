@@ -25,10 +25,16 @@ const BRASIL_API_BASE = 'https://brasilapi.com.br/api/fipe';
 const TPT_URL = 'https://tpt.fipe.org.br';
 const BOMBARCO_URL = 'https://www.bombarco.com.br';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-const MAX_RETRIES = 3;
+const MAX_RETRIES = 5;
 const TIMEOUT = 30000;
 const DRY_RUN = process.argv.includes('--dry-run');
 const OUTPUT_DIR = path.join(__dirname, '..', 'dist-fipe');
+
+// Adaptive rate limiting
+let currentDelay = 800; // ms between requests (starts at 800ms)
+const MIN_DELAY = 500;
+const MAX_DELAY = 10000;
+let consecutiveSuccess = 0;
 
 // ============================================================================
 // HTTP HELPERS
@@ -54,7 +60,10 @@ function httpGet(url, options = {}) {
                 if (res.statusCode >= 200 && res.statusCode < 300) {
                     resolve({ data, statusCode: res.statusCode, headers: res.headers });
                 } else {
-                    reject(new Error(`HTTP ${res.statusCode}: ${url}`));
+                    const err = new Error(`HTTP ${res.statusCode}: ${url}`);
+                    err.statusCode = res.statusCode;
+                    err.retryAfter = res.headers['retry-after'];
+                    reject(err);
                 }
             });
         });
@@ -72,11 +81,32 @@ async function fetchJSON(url) {
 async function fetchWithRetry(url, retries = MAX_RETRIES) {
     for (let i = 0; i < retries; i++) {
         try {
-            return await fetchJSON(url);
+            const result = await fetchJSON(url);
+            // Success! Gradually reduce delay
+            consecutiveSuccess++;
+            if (consecutiveSuccess > 20 && currentDelay > MIN_DELAY) {
+                currentDelay = Math.max(MIN_DELAY, currentDelay - 50);
+                consecutiveSuccess = 0;
+            }
+            return result;
         } catch (err) {
+            // Handle 429 (Too Many Requests) specifically
+            if (err.statusCode === 429) {
+                const retryAfter = parseInt(err.retryAfter) || 0;
+                const waitTime = retryAfter > 0 ? retryAfter * 1000 : Math.min(30000 + (i * 15000), 60000);
+
+                // Increase global delay adaptively
+                currentDelay = Math.min(MAX_DELAY, currentDelay * 1.5);
+                consecutiveSuccess = 0;
+
+                console.warn(`  🛑 Rate limited (429). Waiting ${(waitTime / 1000).toFixed(0)}s. New delay: ${currentDelay.toFixed(0)}ms`);
+                await sleep(waitTime);
+                continue;
+            }
+
             console.warn(`  ⚠️ Attempt ${i + 1}/${retries} failed for ${url}: ${err.message}`);
             if (i < retries - 1) {
-                const delay = Math.pow(2, i) * 1000 + Math.random() * 500;
+                const delay = Math.pow(2, i) * 2000 + Math.random() * 1000;
                 await sleep(delay);
             }
         }
@@ -104,17 +134,25 @@ function parsePrice(priceStr) {
 // STEP 1: FIPE API (carros, motos, caminhões)
 // ============================================================================
 
+// How many recent years to fetch per model (reduces requests by ~70%)
+const MAX_YEARS_PER_MODEL = 3;
+
 async function fetchFipeVehicles(apiTipo, dbTipo) {
     console.log(`\n📦 Fetching ${dbTipo} from FIPE API...`);
+    console.log(`  Strategy: Top ${MAX_YEARS_PER_MODEL} most recent years per model`);
     const vehicles = [];
+    let totalRequests = 0;
+    let skippedModels = 0;
 
     let marcas;
     try {
         marcas = await fetchWithRetry(`${FIPE_BASE}/${apiTipo}/marcas`);
+        totalRequests++;
     } catch {
         console.log(`  ↩️ Fallback to BrasilAPI for ${apiTipo} brands...`);
         marcas = await fetchWithRetry(`${BRASIL_API_BASE}/marcas/v1/${apiTipo}`);
         marcas = marcas.map(m => ({ nome: m.nome, codigo: m.valor || m.codigo }));
+        totalRequests++;
     }
 
     console.log(`  Found ${marcas.length} brands`);
@@ -125,7 +163,9 @@ async function fetchFipeVehicles(apiTipo, dbTipo) {
         const nomeMarca = marca.nome;
 
         try {
+            await sleep(currentDelay);
             const modelosData = await fetchWithRetry(`${FIPE_BASE}/${apiTipo}/marcas/${codigoMarca}/modelos`);
+            totalRequests++;
             const modelos = Array.isArray(modelosData) ? modelosData : (modelosData.modelos || []);
 
             for (const modelo of modelos) {
@@ -133,11 +173,18 @@ async function fetchFipeVehicles(apiTipo, dbTipo) {
                 const nomeModelo = modelo.nome;
 
                 try {
+                    await sleep(currentDelay);
                     const anos = await fetchWithRetry(`${FIPE_BASE}/${apiTipo}/marcas/${codigoMarca}/modelos/${codigoModelo}/anos`);
+                    totalRequests++;
 
-                    for (const ano of anos) {
+                    // Only fetch the N most recent years (reduces requests drastically)
+                    const recentAnos = anos.slice(0, MAX_YEARS_PER_MODEL);
+
+                    for (const ano of recentAnos) {
                         try {
+                            await sleep(currentDelay);
                             const detalhe = await fetchWithRetry(`${FIPE_BASE}/${apiTipo}/marcas/${codigoMarca}/modelos/${codigoModelo}/anos/${ano.codigo}`);
+                            totalRequests++;
 
                             const preco = parsePrice(detalhe.Valor);
                             if (preco <= 0) continue;
@@ -155,29 +202,24 @@ async function fetchFipeVehicles(apiTipo, dbTipo) {
                                 fipe_code: detalhe.CodigoFipe || ''
                             });
                         } catch (e) {
-                            // Skip individual year failures
+                            // Skip individual year failures silently
                         }
                     }
                 } catch (e) {
-                    console.warn(`  ⚠️ Skipping model ${nomeModelo}: ${e.message}`);
+                    skippedModels++;
                 }
-
-                // Rate limiting
-                await sleep(50);
             }
         } catch (e) {
             console.warn(`  ⚠️ Skipping brand ${nomeMarca}: ${e.message}`);
         }
 
-        // Progress
-        if ((i + 1) % 10 === 0 || i === marcas.length - 1) {
-            console.log(`  ${dbTipo}: ${i + 1}/${marcas.length} brands processed (${vehicles.length} vehicles so far)`);
+        // Progress every 5 brands
+        if ((i + 1) % 5 === 0 || i === marcas.length - 1) {
+            console.log(`  ${dbTipo}: ${i + 1}/${marcas.length} brands | ${vehicles.length} vehicles | ${totalRequests} reqs | delay: ${currentDelay.toFixed(0)}ms${skippedModels > 0 ? ` | ${skippedModels} skipped` : ''}`);
         }
-
-        await sleep(100);
     }
 
-    console.log(`  ✅ ${dbTipo}: ${vehicles.length} vehicles total`);
+    console.log(`  ✅ ${dbTipo}: ${vehicles.length} vehicles (${totalRequests} total requests, ${skippedModels} models skipped)`);
     return vehicles;
 }
 
